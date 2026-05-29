@@ -78,20 +78,57 @@ def setup_mlflow(
 
 def _compute_train_stats(
     dataset: ChestMNIST,
+    cache_path: Optional[Path] = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """
-    Calcule mean et std pixel sur le train set UNIQUEMENT
-    (évite la fuite statistique vers val/test).
+    Calcule mean et std pixel sur le train set UNIQUEMENT via l'algorithme
+    de Welford (streaming) — sans jamais charger tout le dataset en RAM.
+    Si cache_path est fourni et existe, charge depuis le cache.
     """
-    loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=0)
-    all_pixels: list[torch.Tensor] = []
+    if cache_path is not None and cache_path.exists():
+        with open(cache_path) as f:
+            stats = json.load(f)
+        log.info("Stats chargées depuis le cache : %s", cache_path)
+        return tuple(stats["mean"]), tuple(stats["std"])
+
+    log.info("Calcul des stats (streaming Welford, peut prendre quelques minutes)…")
+    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+
+    # Welford online : on accumule seulement des scalaires, pas de tensors
+    n_pixels = 0
+    channel_sum = None
+    channel_sum_sq = None
+
     for imgs, _ in loader:
-        # imgs shape: (B, C, H, W) — float après ToTensor
-        all_pixels.append(imgs.view(imgs.size(0), imgs.size(1), -1))
-    concat = torch.cat(all_pixels, dim=0)  # (N, C, H*W)
-    mean = concat.mean(dim=(0, 2)).tolist()
-    std = concat.std(dim=(0, 2)).tolist()
+        # imgs : (B, C, H, W)
+        b, c, h, w = imgs.shape
+        pixels = imgs.view(b, c, -1)          # (B, C, H*W)
+        batch_n = b * h * w
+
+        batch_sum = pixels.sum(dim=(0, 2))    # (C,)
+        batch_sum_sq = (pixels ** 2).sum(dim=(0, 2))
+
+        if channel_sum is None:
+            channel_sum = batch_sum
+            channel_sum_sq = batch_sum_sq
+        else:
+            channel_sum += batch_sum
+            channel_sum_sq += batch_sum_sq
+
+        n_pixels += batch_n
+
+    mean = (channel_sum / n_pixels).tolist()
+    variance = (channel_sum_sq / n_pixels) - torch.tensor(mean) ** 2
+    std = variance.sqrt().tolist()
+
     log.info("Stats train — mean: %s | std: %s", mean, std)
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump({"mean": mean, "std": std}, f)
+        log.info("Stats sauvegardées dans le cache : %s", cache_path)
+
     return tuple(mean), tuple(std)
 
 
@@ -170,7 +207,8 @@ def get_chestmnist_dataloaders(
         size=size,
         root=data_root,
     )
-    mean, std = _compute_train_stats(train_raw)
+    stats_cache = Path(data_root) / f"chestmnist_{size}_stats.json"
+    mean, std = _compute_train_stats(train_raw, cache_path=stats_cache)
 
     # Rechargement avec transforms définitifs
     train_dataset = ChestMNIST(
