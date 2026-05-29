@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 DATASET_NAME = "chestmnist"
 VALID_SIZES = (28, 64, 128, 224)
-CHEST_CLASSES: list[str] = INFO[DATASET_NAME]["label"]  # 14 pathologies
+CHEST_CLASSES: list[str] = list(INFO[DATASET_NAME]["label"].values())  # 14 pathologies
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +137,7 @@ def get_chestmnist_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     data_root: str = "data",
+    download: bool = True,
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
     """
     Télécharge ChestMNIST+ et retourne les DataLoaders Train / Val / Test.
@@ -150,6 +151,7 @@ def get_chestmnist_dataloaders(
         num_workers: Workers pour le DataLoader.
         seed:        Seed du générateur de shuffle (reproductibilité).
         data_root:   Répertoire local de stockage.
+        download:    Si True, télécharge les données. Si False, charge depuis le cache local.
 
     Returns:
         (train_loader, val_loader, test_loader, metadata)
@@ -161,7 +163,13 @@ def get_chestmnist_dataloaders(
 
     # Chargement minimal sans transform pour calculer les stats sur le train
     log.info("Téléchargement / chargement de ChestMNIST+ (size=%d)…", size)
-    train_raw = ChestMNIST(split="train", download=True, size=size, root=data_root)
+    train_raw = ChestMNIST(
+        split="train",
+        transform=transforms.ToTensor(),
+        download=download,
+        size=size,
+        root=data_root,
+    )
     mean, std = _compute_train_stats(train_raw)
 
     # Rechargement avec transforms définitifs
@@ -189,13 +197,14 @@ def get_chestmnist_dataloaders(
 
     generator = torch.Generator()
     generator.manual_seed(seed)
+    pin = torch.cuda.is_available()
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin,
         generator=generator,
     )
     val_loader = DataLoader(
@@ -203,14 +212,14 @@ def get_chestmnist_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin,
     )
 
     metadata = {
@@ -378,6 +387,7 @@ def run_pipeline(
     output_dir: str = "eda_outputs",
     mlflow_experiment: str = "ChestMNIST_Pipeline",
     mlflow_uri: str = "mlruns",
+    download: bool = False,
 ) -> dict:
     """
     Exécute le pipeline complet Phase 1 :
@@ -401,6 +411,7 @@ def run_pipeline(
             num_workers=num_workers,
             seed=seed,
             data_root=data_root,
+            download=download,
         )
 
         # Log métadonnées dataset
