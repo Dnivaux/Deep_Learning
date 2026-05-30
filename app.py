@@ -8,6 +8,7 @@ Lancement : streamlit run app.py
 from __future__ import annotations
 
 import io
+import logging
 import time
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration de la page (doit être le premier appel Streamlit)
@@ -169,33 +172,83 @@ class _MockMultimodal(nn.Module):
 
 @st.cache_resource(show_spinner="Chargement des modèles…")
 def load_models(architecture: str = "simple_cnn") -> dict:
-    """
-    Charge les modèles depuis les checkpoints sauvegardés.
+    """Charge les vrais modèles depuis les checkpoints. Fallback aux mocks si absent."""
+    # Vérifie si les checkpoints Phase 2 & 3 existent
+    checkpoint_classifier = CHECKPOINT_DIR / f"best_{architecture}.pt"
+    checkpoint_ae = CHECKPOINT_DIR / "best_autoencoder.pt"
+    checkpoint_mm = CHECKPOINT_DIR / "best_Multimodal.pt"
 
-    TODO : Remplacer les mocks par les vraies classes :
+    # Si les checkpoints supervisé/anomalie n'existent pas, fallback aux mocks
+    if not checkpoint_classifier.exists() or not checkpoint_ae.exists():
+        log.warning(
+            "Checkpoints Phase 2/3 manquants (%s ou %s) — fallback aux mocks",
+            checkpoint_classifier.exists(), checkpoint_ae.exists()
+        )
+        return {
+            "classifier": _MockClassifier().eval(),
+            "autoencoder": _MockAutoencoder().eval(),
+            "multimodal": _MockMultimodal().eval(),
+            "architecture": architecture,
+            "is_mock": True,
+        }
+
+    try:
         from train_models import build_model, TrainConfig
         from anomaly_detector import ConvAutoencoder
-        from multimodal_poc import MultimodalFusionModel, TextEncoder
+        from multimodal_poc import MultimodalFusionModel
+        import joblib
 
-        cfg = TrainConfig(architecture=architecture)
+        # Classifieur supervisé
+        cfg = TrainConfig(architecture=architecture, image_size=64)
         classifier = build_model(cfg)
-        ckpt = torch.load(CHECKPOINT_DIR / f"best_{architecture}.pt", map_location=DEVICE)
+        ckpt = torch.load(checkpoint_classifier, map_location=DEVICE, weights_only=True)
         classifier.load_state_dict(ckpt["model_state_dict"])
         classifier.eval()
 
-        ae = ConvAutoencoder(latent_dim=128, image_size=64)
-        ae_ckpt = torch.load(CHECKPOINT_DIR / "best_autoencoder.pt", map_location=DEVICE)
-        ae.load_state_dict(ae_ckpt["model_state_dict"])
+        # Autoencodeur
+        ae = ConvAutoencoder(latent_dim=128, image_size=64).to(DEVICE)
+        ae_ckpt = torch.load(checkpoint_ae, map_location=DEVICE, weights_only=True)
+        ae.load_state_dict(ae_ckpt["state_dict"])
         ae.eval()
-    """
-    models = {
-        "classifier": _MockClassifier().eval(),
-        "autoencoder": _MockAutoencoder().eval(),
-        "multimodal":  _MockMultimodal().eval(),
-        "architecture": architecture,
-        "is_mock": True,
-    }
-    return models
+
+        # Multimodal (optionnel — peut venir du POC Phase 4)
+        multimodal = None
+        if checkpoint_mm.exists():
+            try:
+                multimodal = MultimodalFusionModel(vocab_size=5000, n_classes=14).to(DEVICE)
+                mm_ckpt = torch.load(checkpoint_mm, map_location=DEVICE, weights_only=True)
+                multimodal.load_state_dict(mm_ckpt["state_dict"])
+                multimodal.eval()
+            except Exception as e:
+                log.warning("Multimodal non chargé (%s) — mode mock", e)
+                multimodal = _MockMultimodal().eval()
+        else:
+            multimodal = _MockMultimodal().eval()
+
+        # TF-IDF (optionnel)
+        tfidf = None
+        try:
+            tfidf = joblib.load(CHECKPOINT_DIR / "tfidf_vectorizer.pkl")
+        except FileNotFoundError:
+            pass
+
+        return {
+            "classifier": classifier,
+            "autoencoder": ae,
+            "multimodal": multimodal,
+            "tfidf": tfidf,
+            "architecture": architecture,
+            "is_mock": False,
+        }
+    except Exception as e:
+        log.warning("Impossible de charger modèles supervisé/anomalie (%s) — fallback aux mocks", e)
+        return {
+            "classifier": _MockClassifier().eval(),
+            "autoencoder": _MockAutoencoder().eval(),
+            "multimodal": _MockMultimodal().eval(),
+            "architecture": architecture,
+            "is_mock": True,
+        }
 
 
 def preprocess_image(pil_img: Image.Image, size: int = 64) -> torch.Tensor:
@@ -313,9 +366,14 @@ def render_sidebar() -> dict:
 
     models = load_models(architecture=arch)
     if models.get("is_mock"):
-        st.sidebar.warning("⚠️ Mode démo (modèles simulés)")
+        with st.sidebar.expander("⚠️ Mode démo — voir pourquoi"):
+            st.write("Les vrais modèles n'ont pas pu être chargés. Causes possibles :")
+            st.write("- Checkpoints manquants dans `checkpoints/`")
+            st.write("- Import échoué (dépendances manquantes)")
+            st.write("- Train/anomaly_detector/multimodal_poc modules non disponibles")
+            st.code("ls checkpoints/*.pt", language="bash")
     else:
-        st.sidebar.success("✅ Modèles chargés")
+        st.sidebar.success(f"✅ Modèles réels chargés ({arch})")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
@@ -543,18 +601,32 @@ def main() -> None:
 
         if not uploaded_file:
             st.info("👆 Chargez une radiographie pour commencer l'analyse.")
-            # Image d'exemple
+            # Image de démonstration — charge une vraie image OpenI
             with st.expander("💡 Utiliser une image de démonstration"):
-                demo_array = np.random.randint(40, 200, (256, 256), dtype=np.uint8)
-                demo_img = Image.fromarray(demo_array)
-                buf = io.BytesIO()
-                demo_img.save(buf, format="PNG")
-                st.download_button(
-                    "⬇️ Télécharger image test (bruit synthétique)",
-                    data=buf.getvalue(),
-                    file_name="demo_chest.png",
-                    mime="image/png",
-                )
+                demo_img_path = None
+                # Cherche une vraie image OpenI
+                openi_dir = Path("data/openi/openi_images")
+                if openi_dir.exists():
+                    images = list(openi_dir.glob("*.png"))
+                    if images:
+                        demo_img_path = images[0]
+                        st.write(f"📁 Image : `{demo_img_path.name}`")
+
+                if demo_img_path:
+                    # Affiche et propose de télécharger la vraie image
+                    demo_img = Image.open(demo_img_path)
+                    st.image(demo_img, caption="Image OpenI réelle", use_container_width=True)
+                    with open(demo_img_path, "rb") as f:
+                        st.download_button(
+                            "⬇️ Télécharger image OpenI réelle",
+                            data=f.read(),
+                            file_name=demo_img_path.name,
+                            mime="image/png",
+                        )
+                else:
+                    # Fallback : image synthétique si pas d'OpenI
+                    st.warning("❌ Pas de dataset OpenI trouvé. Télécharge une image manuelle.")
+                    st.text("Lance d'abord : python download_openi.py --skip_images")
 
     # ============================
     # COLONNE DROITE — Résultats
