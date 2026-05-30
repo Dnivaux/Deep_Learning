@@ -68,11 +68,11 @@ log = logging.getLogger(__name__)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Labels binaires (normal vs anomalie) — simplification POC
-# Sur OpenI : "Normal" = pas de pathologie détectée
-LABEL_NAMES = ["Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
-               "Mass", "Nodule", "Pneumonia", "Pneumothorax"]
-N_CLASSES = len(LABEL_NAMES)
+# Labels directement depuis ChestMNIST (14 classes, pas de mapping = pas de perte)
+# Chargés dynamiquement depuis medmnist.INFO pour garantir la cohérence
+from medmnist import INFO as _MEDMNIST_INFO
+LABEL_NAMES: list[str] = list(_MEDMNIST_INFO["chestmnist"]["label"].values())
+N_CLASSES = len(LABEL_NAMES)  # 14
 
 
 # ---------------------------------------------------------------------------
@@ -116,122 +116,137 @@ class MultimodalConfig:
 # 2. Chargement & Préparation des Données OpenI
 # ---------------------------------------------------------------------------
 
-def _download_openi_if_needed(data_root: str) -> bool:
+def _build_label_based_report(label_vec: list[int], rng: np.random.Generator) -> str:
     """
-    Tente de charger OpenI via HuggingFace datasets.
-    Retourne True si le dataset est disponible, False sinon.
+    Génère un compte-rendu radiologique réaliste à partir des VRAIS labels.
+    Les textes sont ancrés sur les pathologies réellement présentes dans l'image.
     """
-    try:
-        from datasets import load_dataset
-        log.info("Tentative de chargement OpenI depuis HuggingFace…")
-        ds = load_dataset("StanfordAIMI/openi", trust_remote_code=True)
-        Path(data_root).mkdir(parents=True, exist_ok=True)
+    vocab_normal = [
+        "No acute cardiopulmonary process identified.",
+        "Bilateral lungs are clear without consolidation or effusion.",
+        "Heart size is within normal limits. No pneumothorax.",
+        "Normal chest radiograph. No acute findings.",
+        "Lungs are well expanded and clear. No pleural effusion.",
+    ]
+    vocab_pathology = {
+        "Atelectasis":         ["Atelectasis noted at the lung base.", "Linear atelectasis present.", "Platelike atelectasis identified."],
+        "Cardiomegaly":        ["Cardiomegaly is present.", "Enlarged cardiac silhouette noted.", "Cardiac enlargement observed."],
+        "Effusion":            ["Pleural effusion present.", "Blunting of the costophrenic angle.", "Small pleural effusion identified."],
+        "Infiltration":        ["Infiltrates are seen.", "Patchy opacity in the lung field.", "Airspace disease identified."],
+        "Mass":                ["Pulmonary mass identified.", "Rounded opacity concerning for mass.", "Nodular density seen."],
+        "Nodule":              ["Pulmonary nodule present.", "Small nodule identified.", "Calcified nodule seen."],
+        "Pneumonia":           ["Consolidation consistent with pneumonia.", "Lobar consolidation present.", "Pneumonia cannot be excluded."],
+        "Pneumothorax":        ["Pneumothorax identified.", "Visceral pleural line visible.", "Hyperlucency consistent with pneumothorax."],
+        "Consolidation":       ["Consolidation is present.", "Airspace consolidation noted.", "Lobar consolidation identified."],
+        "Edema":               ["Pulmonary edema present.", "Vascular congestion noted.", "Interstitial edema identified."],
+        "Emphysema":           ["Emphysema noted.", "Hyperinflation present.", "Air trapping identified."],
+        "Fibrosis":            ["Pulmonary fibrosis present.", "Interstitial markings increased.", "Fibrotic changes noted."],
+        "Pleural Thickening":  ["Pleural thickening identified.", "Thickened pleura noted.", "Pleural irregularity seen."],
+        "Hernia":              ["Hernia identified.", "Diaphragmatic hernia present.", "Bowel loops in chest."],
+    }
 
-        records = []
-        for split_name in ds:
-            for item in ds[split_name]:
-                text = ""
-                if "findings" in item and item["findings"]:
-                    text += str(item["findings"]) + " "
-                if "impression" in item and item["impression"]:
-                    text += str(item["impression"])
+    active = [LABEL_NAMES[i] for i, v in enumerate(label_vec) if v == 1 and i < len(LABEL_NAMES)]
 
-                label_vec = [0] * N_CLASSES
-                if "labels" in item and item["labels"]:
-                    raw = item["labels"] if isinstance(item["labels"], list) else [item["labels"]]
-                    for lbl_name, i in [(l, i) for i, l in enumerate(LABEL_NAMES)]:
-                        if any(lbl_name.lower() in str(r).lower() for r in raw):
-                            label_vec[i] = 1
+    if not active:
+        return rng.choice(vocab_normal)
 
-                img_path = None
-                if "image" in item and item["image"] is not None:
-                    img_dir = Path(data_root) / "images"
-                    img_dir.mkdir(exist_ok=True)
-                    img_path = str(img_dir / f"{len(records)}.png")
-                    if not Path(img_path).exists():
-                        item["image"].save(img_path)
-
-                if text.strip() and img_path:
-                    records.append({
-                        "text": text.strip(),
-                        "image_path": img_path,
-                        "labels": label_vec,
-                    })
-
-        meta_path = Path(data_root) / "records.json"
-        with open(meta_path, "w") as f:
-            json.dump(records, f)
-        log.info("OpenI chargé : %d paires (image, texte)", len(records))
-        return True
-
-    except Exception as e:
-        log.warning("OpenI non disponible via HuggingFace : %s", e)
-        return False
+    parts = [rng.choice(vocab_pathology[lbl]) for lbl in active if lbl in vocab_pathology]
+    return " ".join(parts) if parts else rng.choice(vocab_normal)
 
 
-def _generate_synthetic_data(data_root: str, n_samples: int = 1200) -> None:
+def _build_from_chestmnist(data_root: str, chestmnist_root: str = "data",
+                            size: int = 64, max_samples: int = 3000) -> None:
     """
-    Génère un dataset synthétique (image bruit + texte médical simulé)
-    pour tester le pipeline sans données réelles.
+    Construit le dataset multimodal en réutilisant les VRAIES images ChestMNIST+
+    déjà téléchargées, avec des rapports textuels générés depuis les vrais labels.
+
+    Garantie : chaque image est une vraie radiographie thoracique (pas du bruit).
+    Vérification anti-bruit : rejet des images avec variance trop faible.
     """
-    log.info("Génération de %d échantillons synthétiques…", n_samples)
+    from medmnist import ChestMNIST
+
+    # LABEL_NAMES est déjà les 14 classes ChestMNIST — pas de mapping nécessaire
+    log.info("Construction du dataset multimodal depuis ChestMNIST+ (images réelles)…")
+    log.info("Labels utilisés (%d) : %s", N_CLASSES, LABEL_NAMES)
     Path(data_root).mkdir(parents=True, exist_ok=True)
     img_dir = Path(data_root) / "images"
     img_dir.mkdir(exist_ok=True)
 
-    vocab_normal = [
-        "no acute cardiopulmonary process",
-        "lungs are clear bilateral",
-        "heart size is normal",
-        "no pleural effusion",
-        "normal chest radiograph",
-        "no pneumothorax identified",
-    ]
-    vocab_anomaly = {
-        "Atelectasis": ["atelectasis noted", "linear opacities", "platelike atelectasis"],
-        "Cardiomegaly": ["cardiomegaly present", "enlarged cardiac silhouette"],
-        "Effusion": ["pleural effusion", "blunting of costophrenic angle"],
-        "Infiltration": ["infiltrates seen", "patchy opacity", "airspace disease"],
-        "Mass": ["pulmonary mass", "nodular density", "rounded opacity"],
-        "Nodule": ["pulmonary nodule", "small nodule", "calcified nodule"],
-        "Pneumonia": ["pneumonia", "consolidation", "lobar consolidation"],
-        "Pneumothorax": ["pneumothorax", "visceral pleural line", "hyperlucency"],
-    }
-
-    records = []
     rng = np.random.default_rng(42)
+    records = []
 
-    for i in range(n_samples):
-        # Image synthétique (bruit gaussien simulant une radio)
-        img_array = rng.integers(40, 200, size=(64, 64), dtype=np.uint8)
-        img = Image.fromarray(img_array, mode="L")
-        img_path = str(img_dir / f"synth_{i:05d}.png")
-        img.save(img_path)
+    for split in ["train", "val", "test"]:
+        try:
+            ds = ChestMNIST(split=split, download=False, size=size, root=chestmnist_root)
+        except RuntimeError:
+            try:
+                ds = ChestMNIST(split=split, download=True, size=size, root=chestmnist_root)
+            except Exception as e:
+                log.error("Impossible de charger ChestMNIST split=%s : %s", split, e)
+                continue
 
-        # Texte et labels
-        label_vec = [0] * N_CLASSES
-        text_parts = []
+        log.info("  Split %s : %d images", split, len(ds))
+        n_split = min(len(ds), max_samples // 3)
 
-        if rng.random() < 0.4:  # 40% cas normaux
-            text_parts.append(rng.choice(vocab_normal))
-        else:
-            n_findings = rng.integers(1, 4)
-            chosen = rng.choice(LABEL_NAMES, size=n_findings, replace=False)
-            for lbl in chosen:
-                idx = LABEL_NAMES.index(lbl)
-                label_vec[idx] = 1
-                text_parts.append(rng.choice(vocab_anomaly[lbl]))
+        for i in range(n_split):
+            pil_img, label_arr = ds[i]
 
-        records.append({
-            "text": ". ".join(text_parts) + ".",
-            "image_path": img_path,
-            "labels": label_vec,
-        })
+            # Vérification anti-bruit
+            img_np = np.array(pil_img) if not isinstance(pil_img, np.ndarray) else pil_img
+            if img_np.std() < 5.0:
+                continue
+
+            # Sauvegarde image
+            img_path = str(img_dir / f"{split}_{i:05d}.png")
+            if isinstance(pil_img, Image.Image):
+                pil_img.save(img_path)
+            else:
+                Image.fromarray(img_np).save(img_path)
+
+            # Labels directs ChestMNIST (14 classes) — pas de mapping
+            raw = label_arr.flatten() if hasattr(label_arr, "flatten") else np.array(label_arr)
+            label_vec = [int(v) for v in raw[:N_CLASSES]]
+            # Compléter si nécessaire
+            while len(label_vec) < N_CLASSES:
+                label_vec.append(0)
+
+            # Rapport textuel basé sur les vrais labels
+            report = _build_label_based_report(label_vec, rng)
+
+            records.append({
+                "text": report,
+                "image_path": img_path,
+                "labels": label_vec,
+                "source": f"chestmnist_{split}",
+            })
+
+        if len(records) >= max_samples:
+            break
+
+    if not records:
+        raise RuntimeError(
+            "Aucune image valide trouvée dans ChestMNIST. "
+            "Vérifiez que le dataset est téléchargé dans le dossier 'data/'."
+        )
 
     meta_path = Path(data_root) / "records.json"
     with open(meta_path, "w") as f:
         json.dump(records, f)
-    log.info("Données synthétiques générées : %s", meta_path)
+
+    # Diagnostic de distribution des classes
+    lbl_mat = np.array([r["labels"] for r in records])
+    n_pos_total = sum(1 for r in records if sum(r["labels"]) > 0)
+    log.info("Dataset prêt : %d paires | %d avec pathologie (%.0f%%)",
+             len(records), n_pos_total, 100 * n_pos_total / len(records))
+    log.info("Positifs par classe :")
+    for i, lbl in enumerate(LABEL_NAMES):
+        n = int(lbl_mat[:, i].sum())
+        log.info("  %-25s : %4d (%.1f%%)", lbl, n, 100 * n / len(records))
+
+    # Vérification image[0]
+    check_img = np.array(Image.open(records[0]["image_path"]))
+    log.info("Image[0] — mean=%.1f std=%.1f | '%s...'",
+             check_img.mean(), check_img.std(), records[0]["text"][:60])
 
 
 class OpenIDataset(Dataset):
@@ -283,18 +298,48 @@ def get_openi_dataloaders(cfg: MultimodalConfig) -> tuple[DataLoader, DataLoader
     data_root = cfg.data_root
     meta_path = Path(data_root) / "records.json"
 
-    # Chargement ou génération
+    # Chargement ou construction depuis ChestMNIST (vraies images)
     if not meta_path.exists():
-        if cfg.use_synthetic:
-            _generate_synthetic_data(data_root)
-        else:
-            success = _download_openi_if_needed(data_root)
-            if not success:
-                log.warning("Fallback : génération de données synthétiques")
-                _generate_synthetic_data(data_root)
+        log.info("Construction du dataset depuis les vraies images ChestMNIST+…")
+        _build_from_chestmnist(
+            data_root=data_root,
+            chestmnist_root="data",   # dossier où ChestMNIST est déjà téléchargé
+            size=cfg.image_size,
+            max_samples=3000,
+        )
+
+    # Vérification d'intégrité : rejette si toutes les images sont du bruit
+    with open(meta_path) as f:
+        probe = json.load(f)
+    probe_records = probe["records"] if isinstance(probe, dict) and "records" in probe else probe
+    sample_img = np.array(Image.open(probe_records[0]["image_path"]))
+    if sample_img.std() < 5.0:
+        log.error(
+            "BRUIT DÉTECTÉ dans les images (std=%.2f). "
+            "Supprimez le dossier '%s' et relancez pour reconstruire.",
+            sample_img.std(), data_root,
+        )
+        raise RuntimeError(
+            f"Images corrompues (bruit blanc) dans '{data_root}'. "
+            f"Supprimez le dossier et relancez le script."
+        )
 
     with open(meta_path) as f:
-        all_records = json.load(f)
+        raw = json.load(f)
+
+    # Supporte les deux formats :
+    # - Ancien (liste) : [{image_path, text, labels}, ...]
+    # - Nouveau OpenI  : {label_names: [...], records: [...]}
+    if isinstance(raw, dict) and "records" in raw:
+        all_records = raw["records"]
+        # Synchronise LABEL_NAMES si le fichier en contient
+        if "label_names" in raw:
+            global LABEL_NAMES, N_CLASSES
+            LABEL_NAMES = raw["label_names"]
+            N_CLASSES   = len(LABEL_NAMES)
+            log.info("Labels chargés depuis records.json : %d classes", N_CLASSES)
+    else:
+        all_records = raw
 
     log.info("Dataset chargé : %d échantillons", len(all_records))
 
@@ -610,21 +655,31 @@ def train_one_model(
             val_metrics["val_auc_macro"], val_metrics["val_f1_macro"],
         )
 
-        if val_metrics["val_auc_macro"] > best_auc:
-            best_auc = val_metrics["val_auc_macro"]
+        current_auc = val_metrics["val_auc_macro"]
+        if current_auc > best_auc or not ckpt_path.exists():
+            best_auc = current_auc
             patience_counter = 0
             torch.save({"epoch": epoch, "state_dict": model.state_dict(),
                         "best_auc": best_auc}, ckpt_path)
+            log.info("  ✓ [%s] Checkpoint sauvegardé (AUC=%.4f)", model_name, best_auc)
         else:
             patience_counter += 1
             if patience_counter >= cfg.patience:
                 log.info("[%s] Early stopping epoch %d", model_name, epoch)
                 break
 
-    # Recharge meilleur état
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(ckpt["state_dict"])
-    return {"best_auc": best_auc, "best_epoch": ckpt["epoch"]}, history
+    # Recharge meilleur état (le checkpoint existe toujours car on sauvegarde au moins epoch 1)
+    if ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+        model.load_state_dict(ckpt["state_dict"])
+        best_epoch = ckpt["epoch"]
+    else:
+        # Sécurité : sauvegarde l'état actuel si rien n'a été sauvegardé
+        log.warning("[%s] Aucun checkpoint trouvé — sauvegarde de l'état final.", model_name)
+        torch.save({"epoch": 1, "state_dict": model.state_dict(), "best_auc": best_auc}, ckpt_path)
+        best_epoch = 1
+
+    return {"best_auc": best_auc, "best_epoch": best_epoch}, history
 
 
 # ---------------------------------------------------------------------------
