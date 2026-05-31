@@ -2,33 +2,6 @@
 """
 Phase 4 — Preuve de Concept Multimodale (Image + Texte)
 Dataset : OpenI (Indiana University Chest X-ray + Radiology Reports)
-
-=============================================================================
-STRATÉGIE DE FUSION — Late Fusion par Concaténation d'Embeddings
-=============================================================================
-
-Trois approches sont comparées :
-
-1. ImageOnly  : CNN léger → embedding image (256-d) → classifieur
-2. TextOnly   : TF-IDF → MLP → embedding texte (256-d) → classifieur
-3. Multimodal : Fusion TARDIVE (late fusion)
-   - Embedding image (256-d) ⊕ Embedding texte (256-d) → concat (512-d) → classifieur
-
-Pourquoi la Fusion Tardive ?
-- Chaque modalité possède sa propre tour d'encodage indépendante → plus facile
-  à déboguer et à interpréter (on peut tester chaque branche séparément).
-- Robuste à la modalité manquante : si le rapport est vide, la branche texte
-  retourne un vecteur nul et seule l'image contribue.
-- Adapté aux POC : l'alignement sémantique fin (cross-attention, CLIP-style)
-  est réservé aux projets disposant de GPU et de données massives.
-- Alternatives envisagées :
-    * Fusion Précoce (Early) : concaténation au niveau pixel → perd la structure
-    * Fusion Intermédiaire (Mid) : cross-attention entre features → lourd, GPU requis
-    * Fusion Tardive → choix retenu pour ce POC CPU-friendly
-
-Sources théoriques : Baltrusaitis et al. (2019), "Multimodal Machine Learning: A
-Survey and Taxonomy", IEEE TPAMI.
-=============================================================================
 """
 
 from __future__ import annotations

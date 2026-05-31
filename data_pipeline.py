@@ -1,4 +1,3 @@
-# data_pipeline.py
 """
 Phase 1 — Data Pipeline & EDA
 Système d'aide au tri radiologique — ChestMNIST+

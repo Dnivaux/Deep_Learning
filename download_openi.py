@@ -2,7 +2,7 @@
 """
 Téléchargement et parsing du dataset OpenI (NIH NLM)
 Images : https://openi.nlm.nih.gov/imgs/collections/NLMCXR_png.tgz
-Rapports XML : https://openi.nlm.nih.gov/imgs/collections/ecgen-radiology.tar.gz
+Rapports XML : https://openi.nlm.nih.gov/imgs/collections/NLMCXR_reports.tar.gz
 
 Produit : data/openi/records.json avec paires (image_path, text, labels)
 Usage   : python download_openi.py
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 URLS = {
     "images_png": "https://openi.nlm.nih.gov/imgs/collections/NLMCXR_png.tgz",
     "reports_xml_candidates": [
-        "https://openi.nlm.nih.gov/imgs/collections/NLMCXR_reports.tgz",  # URL validée
+        "https://openi.nlm.nih.gov/imgs/collections/NLMCXR_reports.tgz",
         "https://openi.nlm.nih.gov/imgs/collections/ecgen-radiology.tar.gz",
         "https://openi.nlm.nih.gov/imgs/collections/NLMCXR_xml.tgz",
     ],

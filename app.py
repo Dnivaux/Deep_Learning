@@ -1,6 +1,5 @@
-# app.py
 """
-Phase 5 — Démonstrateur Applicatif
+Phase 5 — Interface
 Système d'aide au tri radiologique — ChestMNIST+
 Lancement : streamlit run app.py
 """
