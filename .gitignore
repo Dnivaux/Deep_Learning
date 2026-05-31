@@ -69,3 +69,4 @@ Thumbs.db
 *.log
 *.tmp
 
+generate_figures.py
